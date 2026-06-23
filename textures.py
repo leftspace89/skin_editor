@@ -12,9 +12,11 @@ import numpy as np
 from PIL import Image
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_MODEL00P_DIR = os.path.normpath(os.path.join(_HERE, '..', 'model00p'))
-if _MODEL00P_DIR not in sys.path:
-    sys.path.insert(0, _MODEL00P_DIR)
+# png2dds is bundled in ./vendor (self-contained); fall back to the dev sibling.
+for _p in (os.path.normpath(os.path.join(_HERE, '..', 'model00p')),
+           os.path.join(_HERE, 'vendor')):        # vendor inserted last -> wins
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import png2dds   # noqa: E402  (shared DDS writer)
 

@@ -17,12 +17,13 @@ import sys
 
 import numpy as np
 
-# Make the sibling tools/model00p package importable (mirrors how mdl2obj imports
-# model00p as a sibling). __file__ -> tools/skin_edit/materials.py
+# model00p / mdl2obj / png2dds are bundled in ./vendor so a copied folder is
+# self-contained; fall back to the sibling tools/model00p package in the dev tree.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_MODEL00P_DIR = os.path.normpath(os.path.join(_HERE, '..', 'model00p'))
-if _MODEL00P_DIR not in sys.path:
-    sys.path.insert(0, _MODEL00P_DIR)
+for _p in (os.path.normpath(os.path.join(_HERE, '..', 'model00p')),
+           os.path.join(_HERE, 'vendor')):        # vendor inserted last -> wins
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import model00p          # noqa: E402
 import mdl2obj           # noqa: E402
