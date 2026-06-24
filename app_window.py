@@ -72,15 +72,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
         self.uv_dock = dock
 
-        # Effects panel: live-edit the loaded skin's specular_glow material.
-        self.glow_panel = GlowPanel(self)
-        gdock = QtWidgets.QDockWidget('Effects', self)
-        gdock.setWidget(self.glow_panel)
-        gdock.setAllowedAreas(QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
-        self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, gdock)
-        self.glow_dock = gdock
-
-        self._build_model_browser()
+        # Left dock holds Models + Effects as two tabs of one widget.
+        self.glow_panel = GlowPanel(self)        # live-edit the loaded skin's material
+        self._build_model_browser()              # builds self.model_browser (a QWidget)
+        self.left_tabs = QtWidgets.QTabWidget()
+        self.left_tabs.setTabPosition(QtWidgets.QTabWidget.North)
+        self.left_tabs.setDocumentMode(True)
+        self.left_tabs.addTab(self.model_browser, 'Models')
+        self.left_tabs.addTab(self.glow_panel, 'Effects')
+        ldock = QtWidgets.QDockWidget('Models / Effects', self)
+        ldock.setWidget(self.left_tabs)
+        ldock.setAllowedAreas(QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
+        self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, ldock)
+        self.left_dock = ldock
         self._build_menu()
         self._build_toolbar()
         self.statusBar().showMessage('Ready')
@@ -116,6 +120,9 @@ class MainWindow(QtWidgets.QMainWindow):
         a.triggered.connect(self._create_new_skin)
         a = m.addAction('Delete Skin (removes its files)...')
         a.triggered.connect(self._delete_skin)
+        a = m.addAction('Publish (original names, drag-drop replace)...')
+        a.setShortcut('Ctrl+P')
+        a.triggered.connect(self._publish)
         m.addSeparator()
         a = m.addAction('Quit'); a.setShortcut('Ctrl+Q'); a.triggered.connect(self.close)
 
@@ -124,8 +131,8 @@ class MainWindow(QtWidgets.QMainWindow):
         a.triggered.connect(self.viewport.reset_view)
 
     def _build_model_browser(self):
-        dock = QtWidgets.QDockWidget('Models', self)
-        dock.setAllowedAreas(QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
+        """Build the Models browser as a plain widget (self.model_browser); it is hosted
+        as a tab alongside Effects in the left dock."""
         w = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(w)
         lay.setContentsMargins(4, 4, 4, 4)
@@ -144,9 +151,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(self.model_tree)
         self.model_count_lbl = QtWidgets.QLabel('')
         lay.addWidget(self.model_count_lbl)
-        dock.setWidget(w)
-        self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, dock)
-        self.model_dock = dock
+        self.model_browser = w
 
     # Content subtrees scanned for models (weapons + male/female costumes + characters).
     _MODEL_SUBTREES = ('weapons', 'costumes_f', 'costumes_m',
@@ -297,6 +302,13 @@ class MainWindow(QtWidgets.QMainWindow):
         del_btn.setToolTip('Delete the selected skin (removes its texture + material files)')
         del_btn.clicked.connect(self._delete_skin)
         tb.addWidget(del_btn)
+        tb.addSeparator()
+        pub_btn = QtWidgets.QToolButton()
+        pub_btn.setText('Publish')
+        pub_btn.setToolTip('Publish a drag-and-drop replacement under the original material '
+                           'names (e.g. SN_AWM300.Mat00), mirroring the game tree')
+        pub_btn.clicked.connect(self._publish)
+        tb.addWidget(pub_btn)
 
         tb.addSeparator()
         tb.addWidget(QtWidgets.QLabel(' Map: '))
@@ -830,17 +842,63 @@ class MainWindow(QtWidgets.QMainWindow):
                              siblings=True, glow_mode='both', glow_anim=True, glow_params=gp,
                              glow_shader=shader)
 
+    def _publish(self):
+        """Publish a drop-in replacement set under a chosen folder: the .Mat00 keeps the
+        ORIGINAL material name (SN_AWM300.Mat00) so it replaces the game's material, while
+        the textures keep our skin name (SN_AWM300-<skin>_D.dds) so we don't clobber the
+        game's shared originals. The .Mat00's references point at the skin textures. The
+        tree mirrors the game layout for drag-and-drop. Includes the current effect."""
+        if not self.model:
+            QtWidgets.QMessageBox.information(self, 'Publish', 'Load a model first.')
+            return
+        st = QtCore.QSettings()
+        # The texture name needs a skin tag: use the loaded skin, else the saved/prompted one.
+        skin = self.model.skin or st.value('save_skin', '') or ''
+        if not skin:
+            skin, ok = QtWidgets.QInputDialog.getText(
+                self, 'Publish', 'Skin name (used for the texture filenames):', text='MySkin')
+            if not ok:
+                return
+            skin = re.sub(r'[^A-Za-z0-9_]+', '', skin.strip().replace(' ', '_'))
+            if not skin:
+                QtWidgets.QMessageBox.warning(self, 'Publish', 'Enter a valid skin name.')
+                return
+        st.setValue('save_skin', skin)
+        start = st.value('publish_base', '') or self.game_root
+        base = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Choose publish folder (drag-drop replace)", start)
+        if not base:
+            return
+        st.setValue('publish_base', base)
+        order = ['diffuse', 'normal', 'roughness', 'spec', 'emissive']
+        present = {r for g in self.model.draw_groups for r in g['texset'].buffers}
+        roles = [r for r in order if r in present]
+        gp = self.glow_panel.current_params()
+        shader = self.glow_panel.current_shader()
+        glow = (self.glow_panel.element.currentIndex() != 0) or gp.get('fglowscale', 0.0) > 0.0
+        self._write_new_skin(skin=skin, base=base, roles=roles,
+                             write_mat=True, brightness=1.0, spec=1.0, ref_alpha=True,
+                             glow=glow, siblings=True, glow_mode='both', glow_anim=True,
+                             glow_params=gp, glow_shader=shader, publish=True)
+
     def _write_new_skin(self, skin, base, roles, write_mat, brightness, spec, ref_alpha,
                         glow=False, siblings=True, glow_mode='both', glow_anim=False,
                         glow_scale=3.0, glow_speed=0.8, glow_amount=0.4, glow_params=None,
-                        glow_shader=None):
+                        glow_shader=None, publish=False):
         self._glow_shader = glow_shader   # picked elemental shader (None -> default glow)
         # glow_params (full fX dict from the Glow panel) wins; else just the 3 dialog knobs.
         glow_knobs = dict(glow_params) if glow_params else {
             'fglowscale': glow_scale, 'fglowpulsespeed': glow_speed, 'fglowpulseamount': glow_amount}
+        # TEXTURES always carry the '-<skin>' tag (so we never clobber the game's shared
+        # originals like SN_AWM300_C.dds). PUBLISH writes the .Mat00 under the ORIGINAL
+        # name (no tag) so it replaces the existing material, while its texture references
+        # still point at our skin-named maps. Non-publish tags both as a side-by-side skin.
+        tex_tag = '-%s' % skin
+        mat_tag = '' if publish else tex_tag
         import posixpath
         model_dir = os.path.dirname(os.path.abspath(self.model.path))
-        QtCore.QSettings().setValue('export_base', base)
+        if not publish:
+            QtCore.QSettings().setValue('export_base', base)
         written, warnings = [], []
 
         for g in self.model.draw_groups:
@@ -858,7 +916,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     continue
                 buf = ts.buffers[role]
                 suffix = textures._ROLE_SUFFIX.get(role, '_D')
-                rel = '%s/%s-%s%s.dds' % (texreldir, matname, skin, suffix)
+                rel = '%s/%s%s%s.dds' % (texreldir, matname, tex_tag, suffix)
                 out = os.path.normpath(os.path.join(base, rel))
                 br = brightness if role == 'diffuse' else 1.0
                 sp = spec if role == 'diffuse' else 1.0
@@ -880,7 +938,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if need_spec:
                 em = ts.buffers.get('emissive')
                 if em is not None:
-                    srel = '%s/%s-%s_C.dds' % (texreldir, matname, skin)
+                    srel = '%s/%s%s_C.dds' % (texreldir, matname, tex_tag)
                     sout = os.path.normpath(os.path.join(base, srel))
                     try:
                         textures.save_dds(textures.spec_from_emissive(em), sout)
@@ -891,43 +949,52 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # materials (own piece + PV_/non-PV/_Hilt siblings) pointing at these textures
             if write_mat:
-                diff_bs = ('%s/%s-%s_D.dds' % (texreldir, matname, skin)).replace('/', '\\')
-                em_bs = ('%s/%s-%s_EM.dds' % (texreldir, matname, skin)).replace('/', '\\') \
+                diff_bs = ('%s/%s%s_D.dds' % (texreldir, matname, tex_tag)).replace('/', '\\')
+                em_bs = ('%s/%s%s_EM.dds' % (texreldir, matname, tex_tag)).replace('/', '\\') \
                     if (wrote_emissive or glow) else None
                 # the glow material always keeps the emissive (self-glow); the 'both'
                 # mode additionally references the spec map for a light-reactive flare.
                 mat_em, mat_sp = em_bs, spec_bs
                 self._emit_skin_mat(matname, matname, skin, base, matreldir, model_dir,
                                     diff_bs, mat_em, mat_sp, glow, written, warnings,
-                                    glow_anim=glow_anim, glow_knobs=glow_knobs)
+                                    glow_anim=glow_anim, glow_knobs=glow_knobs, tag=mat_tag)
                 # sibling view materials reuse the SAME skin textures (shared atlas)
                 if siblings:
                     for sib in materials.sibling_materials(matname, self.game_root, model_dir):
                         self._emit_skin_mat(sib, matname, skin, base, matreldir, model_dir,
                                             diff_bs, mat_em, mat_sp, glow, written, warnings,
-                                            glow_anim=glow_anim, glow_knobs=glow_knobs)
+                                            glow_anim=glow_anim, glow_knobs=glow_knobs, tag=mat_tag)
 
         if 'emissive' in roles and not glow:
             warnings.append("emissive (_EM) textures were written but NOT referenced by "
                             "the materials - the original shader doesn't support a glow "
                             "map. Re-run with 'Make it glow' checked to wire them via "
                             "specular.fx.")
-        msg = 'New skin "%s" written under\n%s\n\n%s' % (skin, base, '\n'.join(written))
+        if publish:
+            msg = ('Published "%s" (original .Mat00 name, skin-named textures — '
+                   'drag-and-drop replace) under\n%s\n\n%s'
+                   % (skin, base, '\n'.join(written)))
+        else:
+            msg = 'New skin "%s" written under\n%s\n\n%s' % (skin, base, '\n'.join(written))
         if warnings:
             msg += '\n\nWarnings:\n- ' + '\n- '.join(warnings)
         if siblings:
-            msg += ('\n\nNote: sibling (PV_/_Hilt) materials point at the same skin '
+            msg += ('\n\nNote: sibling (PV_/_Hilt) materials point at the same '
                     'textures, which is correct when the views share a texture atlas.')
-        # Make the new skin appear in the Skin selector immediately (no restart needed).
-        if skin and self.model is not None:
+        if publish:
+            msg += ('\n\nDrop the published folder into your game (it mirrors the game '
+                    'tree) to replace the originals. Restart the game to reload shaders.')
+        # Make a new skin appear in the Skin selector immediately (publish keeps the
+        # original names, so it does not add a skin entry).
+        elif skin and self.model is not None:
             if skin not in (self.model.skins or []):
                 self.model.skins = list(self.model.skins or []) + [skin]
             self._refresh_skins()
-        QtWidgets.QMessageBox.information(self, 'Saved', msg)
+        QtWidgets.QMessageBox.information(self, 'Published' if publish else 'Saved', msg)
 
     def _emit_skin_mat(self, mat_stem, tex_stem, skin, base, matreldir, model_dir,
                       diff_bs, em_bs, spec_bs, glow, written, warnings,
-                      glow_anim=False, glow_knobs=None):
+                      glow_anim=False, glow_knobs=None, tag=None):
         """Clone <mat_stem>.Mat00 into <mat_stem>-<skin>.Mat00 pointing at the skin
         textures. A glow skin retargets at specular.fx (static) or specular_glow.fx
         (glowanim - animated pulse, when glow_anim) and is rebuilt CLEAN from that
@@ -962,7 +1029,8 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 data = mat00io.synthesize(diff_bs, shader=mat00io.DEFAULT_WEAPON_SHADER)
                 warnings.append('no original %s.Mat00 found - synthesized one' % mat_stem)
-            matrel = '%s/%s-%s.Mat00' % (matreldir, mat_stem, skin)
+            mat_tag = ('-%s' % skin) if tag is None else tag
+            matrel = '%s/%s%s.Mat00' % (matreldir, mat_stem, mat_tag)
             mout = os.path.normpath(os.path.join(base, matrel))
             os.makedirs(os.path.dirname(mout), exist_ok=True)
             open(mout, 'wb').write(data)
@@ -1289,11 +1357,18 @@ class GlowPanel(QtWidgets.QWidget):
         self.pattern_combo = QtWidgets.QComboBox()
         self.pattern_combo.addItem('(keep current emissive)')
         self._pattern_paths = []
+        # Accept any PIL-readable image (load_dds handles them all), not just .dds, so a
+        # dropped-in skull.png shows up alongside the bundled .dds patterns. If both a
+        # .dds and another format share a stem, the .dds wins (added first when sorted).
+        pat_exts = ('.dds', '.png', '.jpg', '.jpeg', '.bmp', '.tga')
+        seen_stems = set()
         try:
             for f in sorted(os.listdir(PATTERN_DIR)):
-                if f.lower().endswith('.dds'):
+                stem, ext = os.path.splitext(f)
+                if ext.lower() in pat_exts and stem.lower() not in seen_stems:
+                    seen_stems.add(stem.lower())
                     self._pattern_paths.append(os.path.join(PATTERN_DIR, f))
-                    self.pattern_combo.addItem(os.path.splitext(f)[0])
+                    self.pattern_combo.addItem(stem)
         except OSError:
             pass
         self.pattern_combo.activated.connect(self._on_pattern)
