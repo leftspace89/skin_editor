@@ -39,40 +39,65 @@ _USAGE = {0: 'POSITION', 1: 'BLENDWEIGHT', 2: 'BLENDINDICES', 3: 'NORMAL',
           5: 'TEXCOORD', 6: 'TANGENT', 7: 'BINORMAL'}
 
 
-def parse_vertex_decl(d):
-    """Parse the D3DVERTEXELEMENT9 array in the file tail. Returns
-    (stride, offsets) where offsets maps 'POSITION'/'NORMAL'/'TEXCOORD0'/
-    'BLENDWEIGHT'/'BLENDINDICES'/... to byte offsets. Falls back to the
-    72-byte weapon layout if no declaration is found.
+_DECL_END = b'\xff\x00\x00\x00\x11\x00\x00\x00'   # stream=0xFF, off=0, type=0x11
 
+
+def _decode_decl_at(d, end):
+    """Decode the stream-0 D3DVERTEXELEMENT9 array that ends at marker `end`.
     Each element is 8 bytes: u16 stream, u16 offset, u8 type, u8 method,
-    u8 usage, u8 usageIndex. The array ends with stream==0xFF, type==0x11."""
-    # find the END marker (stream=0x00FF, offset=0, type=0x11) scanning from end
-    p = len(d) - 8
-    while p >= 0:
-        s, off, typ = struct.unpack_from('<HHB', d, p)
-        if s == 0xFF and typ == 0x11:
-            # walk backward collecting stream-0 elements
-            elems = []
-            q = p - 8
-            while q >= 0:
-                es, eoff, etyp, _meth, eusage, euidx = struct.unpack_from('<HHBBBB', d, q)
-                if es != 0 or etyp not in _DECLTYPE_SIZE:
-                    break
-                elems.append((eoff, etyp, eusage, euidx))
-                q -= 8
-            if len(elems) >= 3:
-                elems.reverse()
-                offsets, stride = {}, 0
-                for eoff, etyp, eusage, euidx in elems:
-                    name = _USAGE.get(eusage, 'U%d' % eusage)
-                    if eusage in (5, 6, 7):          # TEXCOORD/TANGENT/BINORMAL indexed
-                        name += str(euidx)
-                    offsets[name] = eoff
-                    stride = max(stride, eoff + _DECLTYPE_SIZE[etyp])
-                if stride >= 16:
-                    return stride, offsets
-        p -= 1
+    u8 usage, u8 usageIndex. Returns (stride, offsets, usages) or None."""
+    elems = []
+    q = end - 8
+    while q >= 0:
+        es, eoff, etyp, _meth, eusage, euidx = struct.unpack_from('<HHBBBB', d, q)
+        if es != 0 or etyp not in _DECLTYPE_SIZE:
+            break
+        elems.append((eoff, etyp, eusage, euidx))
+        q -= 8
+    if len(elems) < 3:
+        return None
+    elems.reverse()
+    offsets, usages, stride = {}, set(), 0
+    for eoff, etyp, eusage, euidx in elems:
+        name = _USAGE.get(eusage, 'U%d' % eusage)
+        if eusage in (5, 6, 7):              # TEXCOORD/TANGENT/BINORMAL indexed
+            name += str(euidx)
+        offsets[name] = eoff
+        usages.add(eusage)
+        stride = max(stride, eoff + _DECLTYPE_SIZE[etyp])
+    if stride < 16:
+        return None
+    return stride, offsets, usages
+
+
+def _find_decl_end(d):
+    """Offset of the REAL vertex-declaration END marker. Character/costume meshes
+    carry a SECOND false marker in their trailing animation data, so scanning from
+    the file end (rfind) picks the wrong one. Choose the first marker whose element
+    array forms a true vertex layout (POSITION + NORMAL + TEXCOORD all present)."""
+    markers, i = [], d.find(_DECL_END)
+    while i >= 0:
+        markers.append(i)
+        i = d.find(_DECL_END, i + 1)
+    fallback = None
+    for end in markers:
+        r = _decode_decl_at(d, end)
+        if r and {0, 3, 5} <= r[2]:           # POSITION, NORMAL, TEXCOORD
+            return end
+        if r and fallback is None:
+            fallback = end
+    return fallback if fallback is not None else (markers[-1] if markers else -1)
+
+
+def parse_vertex_decl(d):
+    """Parse the D3DVERTEXELEMENT9 array. Returns (stride, offsets) where offsets
+    maps 'POSITION'/'NORMAL'/'TEXCOORD0'/'BLENDWEIGHT'/'BLENDINDICES'/... to byte
+    offsets. Falls back to the 72-byte weapon layout if no declaration is found."""
+    end = _find_decl_end(d)
+    if end >= 0:
+        r = _decode_decl_at(d, end)
+        if r and r[0] >= 16:
+            return r[0], r[1]
     return VSTRIDE, {'POSITION': 0, 'NORMAL': 12, 'TEXCOORD0': 24, 'TEXCOORD1': 32,
                      'TANGENT0': 40, 'BINORMAL0': 52, 'BLENDWEIGHT': 64, 'BLENDINDICES': 68}
 
@@ -210,7 +235,7 @@ def parse_sections(d):
         u32 section_count
         per section: 9 u32 fields [_, vert_count, stride, _, _, face_count, _,
                      bone_count, _]  then  bone_count bytes (the bone-set)."""
-    end = d.rfind(b'\xff\x00\x00\x00\x11\x00\x00\x00')      # vertex-decl END marker
+    end = _find_decl_end(d)                                 # vertex-decl END marker
     if end < 0:
         return None
     o = end + 8
@@ -303,7 +328,7 @@ def parse_section_ranges(d):
     istart (index, = field*... see below), fcount, matidx, boneset. These are the
     model's render 'objects' (one per original source object/material). Returns []
     if no section table."""
-    end = d.rfind(b'\xff\x00\x00\x00\x11\x00\x00\x00')
+    end = _find_decl_end(d)
     if end < 0:
         return []
     o = end + 8

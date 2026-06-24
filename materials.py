@@ -135,6 +135,64 @@ def find_mat00(name, game_root, model_dir=None):
     return _mat_index(game_root).get(name.lower())
 
 
+def _near_model_material_dirs(model_dir):
+    """The model's own material dir(s): ../materials, ./materials, ../../materials."""
+    if not model_dir:
+        return []
+    cand = [os.path.normpath(os.path.join(model_dir, '..', 'materials')),
+            os.path.join(model_dir, 'materials'),
+            os.path.normpath(os.path.join(model_dir, '..', '..', 'materials'))]
+    out, seen = [], set()
+    for d in cand:
+        if d not in seen and os.path.isdir(d):
+            seen.add(d); out.append(d)
+    return out
+
+
+def variant_materials(model_dir):
+    """List (stem, abs_path) of every non-'-'-skinned .Mat00 in the model's OWN
+    materials dir(s). Character body/arm/leg base models (e.g. Body_B_M) ship NO
+    '<base>' material of their own — only named variants (Body_Race_Asian_M, ...). The
+    per-part materials dir IS the grouping, so each such .Mat00 becomes a selectable
+    'skin'. Weapon/costume models resolve their base directly and never reach this."""
+    out, seen = [], set()
+    for d in _near_model_material_dirs(model_dir):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for nm in names:
+            if not nm.lower().endswith('.mat00'):
+                continue
+            stem = nm[:-6]
+            if '-' in stem or stem.lower() in seen:
+                continue
+            seen.add(stem.lower())
+            out.append((stem, os.path.join(d, nm)))
+    return out
+
+
+def _roles_from_mat00(mat_path, game_root, model_dir):
+    """Resolve {role: abs} from a .Mat00's diffuse map. Handles the indexed prop names
+    (tDiffuseMap / tDiffuseMap3 / ...) that character shaders use; the stored path may
+    be game-root-relative or just a basename."""
+    defs = mdl2obj.parse_mat00(mat_path)
+    if not defs:
+        return {}
+    rel = None
+    for k, v in defs.items():
+        if (isinstance(k, str) and k.lower().startswith('tdiffusemap')
+                and isinstance(v, str) and v.lower().endswith('.dds')):
+            rel = v.replace('\\', '/')
+            break
+    if not rel:
+        return {}
+    diff = os.path.join(game_root, rel)
+    if not os.path.isfile(diff):
+        diff = find_texture(os.path.basename(rel), game_root, model_dir)
+    return mdl2obj._discover_siblings(diff) if diff and os.path.isfile(diff) else {}
+
+
 def sibling_materials(matname, game_root, model_dir=None):
     """Find related material stems (first/third-person + piece variants) sharing a
     weapon's core name. The game uses e.g. 'Melee_BaseballBat' (3rd person),
@@ -165,7 +223,7 @@ def sibling_materials(matname, game_root, model_dir=None):
     return out
 
 
-def enumerate_skins(base, game_root, model_dir=None):
+def enumerate_skins(base, game_root, model_dir=None, model_name=None):
     """Skins are encoded in the diffuse texture filenames as '<base>[-<skin>]_D.dds'.
     Scan the near-the-model dirs (and, if a base diffuse exists, its own folder) for
     those. Returns ['', <skin>, ...], '' meaning the un-skinned base."""
@@ -186,7 +244,19 @@ def enumerate_skins(base, game_root, model_dir=None):
                 m = pat.match(nm)
                 if m:
                     skins.add(m.group(1) or '')
-    return [''] + sorted(s for s in skins if s)
+    result = [''] + sorted(s for s in skins if s)
+    # Character body/arm/leg base models carry no '<base>' diffuse, no '<base>-skin'
+    # textures AND no self-named '<base>.Mat00' — only named variant materials in their
+    # own dir (Body_B_M -> Body_Race_Asian_M). Expose those as skins. The self-Mat00 gate
+    # keeps weapons (whose texture name != model name) from listing siblings as skins —
+    # check the model's OWN name too, since `base` may be the digit-stripped form.
+    self_named = find_mat00(base, game_root, model_dir) or (
+        model_name and find_mat00(model_name, game_root, model_dir))
+    if result == [''] and not base_diff and not self_named:
+        variants = [stem for stem, _ in variant_materials(model_dir)]
+        if variants:
+            return [''] + variants
+    return result
 
 
 def resolve_roles(base, game_root, skin='', piece_suffix='', model_dir=None):
@@ -201,6 +271,15 @@ def resolve_roles(base, game_root, skin='', piece_suffix='', model_dir=None):
                 return mdl2obj._discover_siblings(p)
         return None
 
+    # 0) a character 'skin' that names a full variant material in the model's own dir
+    #    (e.g. Body_Race_Asian_M) -> resolve that .Mat00's diffuse directly.
+    if skin:
+        for stem, mp in variant_materials(model_dir):
+            if stem.lower() == skin.lower():
+                roles = _roles_from_mat00(mp, game_root, model_dir)
+                if roles.get('diffuse'):
+                    return roles
+
     # 1) skin requested -> the skinned filename is authoritative
     if skin:
         roles = by_name([
@@ -214,6 +293,16 @@ def resolve_roles(base, game_root, skin='', piece_suffix='', model_dir=None):
     info = mdl2obj.resolve_material(base, game_root, skin=skin or None, suffix=piece_suffix)
     if info and info.get('roles', {}).get('diffuse'):
         return info['roles']
+    # 2b) the model's OWN '<base>.Mat00' in its near-model materials dir — authoritative
+    #     for the diffuse when the texture name differs from the model name (e.g. weapon
+    #     parts under weapons/0_parts: ad_wr01.Mat00 -> wr-m01_Di.dds). resolve_material
+    #     only searches the global weapon MAT_DIRS, so it misses these.
+    if not piece_suffix:
+        mp = find_mat00(base, game_root, model_dir)
+        if mp:
+            roles = _roles_from_mat00(mp, game_root, model_dir)
+            if roles.get('diffuse'):
+                return roles
     # 3) skin-less filename fallback
     return by_name(['%s%s_D.dds' % (base, piece_suffix), '%s_D.dds' % base]) or {}
 
@@ -225,7 +314,19 @@ def _resolve_base(model_name, game_root, skin, model_dir=None):
         roles = resolve_roles(b, game_root, skin=skin, model_dir=model_dir)
         if roles.get('diffuse'):
             return b, roles
-        if enumerate_skins(b, game_root, model_dir) != ['']:
+        sk = enumerate_skins(b, game_root, model_dir, model_name=model_name)
+        if sk != ['']:
+            # Variant-only models (no base diffuse) default to a variant so the initial
+            # view is textured; prefer the variant whose name matches the model, else the
+            # first that actually resolves on disk (some assets ship partial). The user
+            # switches via the Skin combo.
+            if not roles.get('diffuse') and len(sk) > 1:
+                ordered = sorted(sk[1:], key=lambda s: s.lower() != model_name.lower())
+                for cand in ordered:
+                    r = resolve_roles(b, game_root, skin=cand, model_dir=model_dir)
+                    if r.get('diffuse'):
+                        roles = r
+                        break
             return b, roles
     return model_name, {}
 
@@ -314,7 +415,7 @@ def load(model_path, game_root, skin=''):
 
     model_dir = os.path.dirname(os.path.abspath(model_path))
     lm.base, body_roles = _resolve_base(m.name, game_root, skin, model_dir)
-    lm.skins = enumerate_skins(lm.base, game_root, model_dir)
+    lm.skins = enumerate_skins(lm.base, game_root, model_dir, model_name=m.name)
 
     # Material pieces (body / scope) via mdl2obj's vertex-range split; resolve each
     # piece's textures by filename convention (resolve_roles), bucketing triangles

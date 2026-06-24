@@ -145,28 +145,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, dock)
         self.model_dock = dock
 
+    # Content subtrees scanned for models (weapons + male/female costumes + characters).
+    _MODEL_SUBTREES = ('weapons', 'costumes_f', 'costumes_m',
+                       'characters_f', 'characters_m', 'characters', 'props')
+
     def _scan_models(self):
-        """Find non-empty .Model00p files under the game root, preferring a
-        'weapons' subtree; returns [(label, fullpath)] sorted."""
+        """Find non-empty .Model00p files under the game root's content subtrees
+        (weapons, costumes_f/m, characters, …); returns [(label, fullpath)] sorted."""
         root = self.game_root
         if not os.path.isdir(root):
             return []
-        base = os.path.join(root, 'weapons')
-        scan_root = base if os.path.isdir(base) else root
-        found = []
-        cap = 4000
-        for dirpath, _dirs, files in os.walk(scan_root):
-            for fn in files:
-                if fn.lower().endswith('.model00p'):
-                    full = os.path.join(dirpath, fn)
-                    try:
-                        if os.path.getsize(full) <= 0:   # 0-byte view-model stubs
+        scan_roots = [os.path.join(root, s) for s in self._MODEL_SUBTREES
+                      if os.path.isdir(os.path.join(root, s))] or [root]
+        found, cap = [], 12000
+        for scan_root in scan_roots:
+            for dirpath, _dirs, files in os.walk(scan_root):
+                for fn in files:
+                    if fn.lower().endswith('.model00p'):
+                        full = os.path.join(dirpath, fn)
+                        try:
+                            if os.path.getsize(full) <= 0:   # 0-byte view-model stubs
+                                continue
+                        except OSError:
                             continue
-                    except OSError:
-                        continue
-                    found.append((os.path.relpath(full, root).replace('\\', '/'), full))
-                    if len(found) >= cap:
-                        break
+                        found.append((os.path.relpath(full, root).replace('\\', '/'), full))
+                        if len(found) >= cap:
+                            break
+                if len(found) >= cap:
+                    break
             if len(found) >= cap:
                 break
         found.sort(key=lambda t: t[0].lower())

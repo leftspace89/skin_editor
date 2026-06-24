@@ -265,7 +265,8 @@ _ROLE_SUFFIX = {'diffuse': '_D', 'normal': '_N', 'roughness': '_R',
 
 # Folder names that mark the start of a game-relative path. Used to recover the
 # in-game subpath even when a file is loaded from outside the configured game root.
-_GAME_ANCHORS = ('weapons', 'materials', 'models', 'characters', 'props')
+_GAME_ANCHORS = ('weapons', 'costumes_f', 'costumes_m', 'characters_f',
+                 'characters_m', 'materials', 'models', 'characters', 'props')
 
 
 def extract_game_subpath(path):
