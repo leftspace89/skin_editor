@@ -1,6 +1,7 @@
 """app_window.py - MainWindow wiring the 3D viewport, 2D UV panel, toolbars and
 the export dialog together."""
 import os
+import re
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -113,6 +114,8 @@ class MainWindow(QtWidgets.QMainWindow):
         a = m.addAction('Create New Skin (named, with options)...')
         a.setShortcut('Ctrl+Shift+N')
         a.triggered.connect(self._create_new_skin)
+        a = m.addAction('Delete Skin (removes its files)...')
+        a.triggered.connect(self._delete_skin)
         m.addSeparator()
         a = m.addAction('Quit'); a.setShortcut('Ctrl+Q'); a.triggered.connect(self.close)
 
@@ -289,6 +292,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.skin_combo.setMinimumWidth(90)
         self.skin_combo.currentTextChanged.connect(self._switch_skin)
         tb.addWidget(self.skin_combo)
+        del_btn = QtWidgets.QToolButton()
+        del_btn.setText('🗑')
+        del_btn.setToolTip('Delete the selected skin (removes its texture + material files)')
+        del_btn.clicked.connect(self._delete_skin)
+        tb.addWidget(del_btn)
 
         tb.addSeparator()
         tb.addWidget(QtWidgets.QLabel(' Map: '))
@@ -690,6 +698,102 @@ class MainWindow(QtWidgets.QMainWindow):
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
         self._write_new_skin(**dlg.result())
+
+    # ---- delete skin ---------------------------------------------------
+    def _skin_files(self, skin):
+        """Every on-disk file belonging to a user-created '<mat>-<skin>' skin of the
+        active model: the skin-tagged textures (<mat>-<skin>_D/_N/...dds) and the cloned
+        materials (<mat>-<skin>.Mat00, including PV_/_Hilt siblings). Searches the
+        near-the-model textures/materials dirs plus the dirs the model's roles actually
+        resolved from. Matches the EXACT skin token so 'Gold' never catches 'Gold2'."""
+        model_dir = os.path.dirname(os.path.abspath(self.model.path))
+        stems = set()
+        for g in self.model.draw_groups:
+            stems.add(g['texset'].name)
+            for sib in materials.sibling_materials(g['texset'].name, self.game_root, model_dir):
+                stems.add(sib)
+        tex_dirs, mat_dirs = set(), set()
+        for d in materials._search_dirs(self.game_root, model_dir):
+            if os.path.isdir(d):
+                tex_dirs.add(os.path.normpath(d))
+        for d in materials._mat_search_dirs(self.game_root, model_dir):
+            if os.path.isdir(d):
+                mat_dirs.add(os.path.normpath(d))
+        for g in self.model.draw_groups:
+            for p in g['texset'].roles.values():
+                if p and os.path.isfile(p):
+                    tex_dirs.add(os.path.normpath(os.path.dirname(p)))
+        out, seen = [], set()
+
+        def collect(dirs, pat):
+            for d in dirs:
+                try:
+                    names = os.listdir(d)
+                except OSError:
+                    continue
+                for nm in names:
+                    if pat.match(nm):
+                        ap = os.path.normpath(os.path.join(d, nm))
+                        if ap.lower() not in seen and os.path.isfile(ap):
+                            seen.add(ap.lower()); out.append(ap)
+
+        for stem in stems:
+            pre = re.escape('%s-%s' % (stem, skin))
+            collect(tex_dirs, re.compile(r'(?i)^' + pre + r'(_[A-Za-z0-9]+)?\.dds$'))
+            collect(mat_dirs, re.compile(r'(?i)^' + pre + r'\.Mat00$'))
+        return sorted(out)
+
+    def _delete_skin(self):
+        """Delete the selected skin and remove its texture + material files from disk."""
+        if not self.model:
+            QtWidgets.QMessageBox.information(self, 'Delete skin', 'Load a model first.')
+            return
+        text = self.skin_combo.currentText()
+        skin = '' if text == '(base)' else text
+        if not skin:
+            QtWidgets.QMessageBox.information(
+                self, 'Delete skin',
+                'Select a skin in the Skin selector first.\nThe base (un-skinned) entry '
+                'cannot be deleted.')
+            return
+        files = self._skin_files(skin)
+        if not files:
+            QtWidgets.QMessageBox.information(
+                self, 'Delete skin',
+                'No "%s-..." files were found for skin "%s".\n\nThis is either a built-in '
+                'game variant/material (not a skin you created here) or its files live '
+                'elsewhere — those are left untouched for safety.' % (
+                    self.model.draw_groups[0]['texset'].name if self.model.draw_groups else '',
+                    skin))
+            return
+        listing = '\n'.join('  ' + os.path.relpath(f, self.game_root).replace('\\', '/')
+                            for f in files)
+        ans = QtWidgets.QMessageBox.warning(
+            self, 'Delete skin "%s"?' % skin,
+            'This permanently deletes %d file(s):\n\n%s\n\nThis cannot be undone.'
+            % (len(files), listing),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Cancel)
+        if ans != QtWidgets.QMessageBox.Yes:
+            return
+        removed, errors = [], []
+        for f in files:
+            try:
+                os.remove(f)
+                removed.append(f)
+            except OSError as e:
+                errors.append('%s: %s' % (os.path.basename(f), e))
+        # Drop the stale index entries so the skin disappears from the selector.
+        materials._DDS_INDEX.pop(self.game_root, None)
+        materials._MAT_INDEX.pop(self.game_root, None)
+        # Reload at the base skin so the now-deleted skin is gone from the combo.
+        self.open_model(self.model.path, skin='')
+        msg = 'Deleted %d file(s) for skin "%s".' % (len(removed), skin)
+        if errors:
+            msg += '\n\nFailed:\n- ' + '\n- '.join(errors)
+            QtWidgets.QMessageBox.warning(self, 'Delete skin', msg)
+        else:
+            self.statusBar().showMessage(msg)
 
     def _save_all(self):
         """One button for everything: write ALL current textures + the material(s) for
